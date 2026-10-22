@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nef-focus-rater"
+dynamic = ["version"]
+description = "Find out-of-focus shots in Nikon NEF files and write star ratings (XMP:Rating) with exiftool."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "samurai-human-go" }]
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "PySide6-Essentials>=6.5",
+]
+keywords = ["nikon", "nef", "focus", "blur detection", "exiftool", "rating", "culling"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics",
+]
+
+[project.urls]
+Homepage = "https://github.com/git-756/nef-focus-rater"
+Issues = "https://github.com/git-756/nef-focus-rater/issues"
+
+[project.scripts]
+nef-focus-rater-cli = "nef_focus_rater.cli:main"
+
+[project.gui-scripts]
+nef-focus-rater = "nef_focus_rater.gui:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["nef_focus_rater"]
+
+[tool.setuptools.dynamic]
+version = { attr = "nef_focus_rater.__version__" }
+
+[tool.uv]
+# 外付けドライブなどキャッシュと別ボリュームでも警告なしでインストールする
+link-mode = "copy"
