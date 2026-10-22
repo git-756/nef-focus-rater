@@ -2,6 +2,7 @@
 """Qt に依存しない中核処理：exiftool 連携、プレビュー読み込み、ピント判定、レーティング書き込み。"""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -231,6 +232,9 @@ def read_metadata(et: ExifTool, paths: Sequence[str],
             ph.orientation = _to_int(d.get("Orientation")) or 1
             r = d.get("Rating")
             ph.rating = _to_int(r) if r is not None else 0
+            nr = read_nksc_rating(nksc_path(src))
+            if nr is not None:  # NX Studio は調整ファイルの★を優先して表示する
+                ph.rating = nr
             ph.focus_result = str(d.get("FocusResult", ""))
             ph.af_mode = str(d.get("AFAreaMode", ""))
             iw, ih = _to_int(d.get("AFImageWidth")), _to_int(d.get("AFImageHeight"))
@@ -423,6 +427,123 @@ def percentile_threshold(scores: Sequence[float], percent: float) -> float:
 
 
 # --------------------------------------------------------------------------
+# NX Studio の調整ファイル（NKSC_PARAM/<ファイル名>.nksc）
+# --------------------------------------------------------------------------
+# NX Studio は調整ファイルがある写真では NEF 本体の★を見ない。表示に使うのは、調整ファイルに
+# base64 で埋め込まれた XMP（<ast:XMLPackets>）の xmp:Rating。<nine:Rating> にも★の欄があるので両方そろえる。
+# 形式は非公開のため、exiftool で書き直さず（nine 名前空間のタグが消える）★の部分だけを置き換える。
+_NKSC_NINE = re.compile(rb"(<nine:Rating>)(\d)(</nine:Rating>)")
+_NKSC_PACKET = re.compile(rb"<ast:XMLPackets[^>]*>\s*<rdf:value>([^<]+)</rdf:value>")
+_XMP_RATING = (re.compile(rb"(<xmp:Rating>)(-?\d)(</xmp:Rating>)"),
+               re.compile(rb'(xmp:Rating=")(-?\d)(")'))
+_XMP_NS = b'xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+_B64_NL = b"&#xA;"   # 埋め込み XMP の base64 は &#xA; で改行されている
+
+
+def nksc_path(path: str) -> Optional[str]:
+    """NX Studio の調整ファイルがあればそのパスを返す。"""
+    p = os.path.join(os.path.dirname(path), "NKSC_PARAM", os.path.basename(path) + ".nksc")
+    return p if os.path.isfile(p) else None
+
+
+def _nksc_packet(data: bytes):
+    """調整ファイルに埋め込まれた XMP を (正規表現のマッチ, XMP のバイト列) で返す。"""
+    m = _NKSC_PACKET.search(data)
+    if not m:
+        return None
+    try:
+        return m, base64.b64decode(m.group(1).replace(_B64_NL, b""), validate=True)
+    except ValueError:
+        return None
+
+
+def _wrap_b64(data: bytes, width: int) -> bytes:
+    flat = base64.b64encode(data)
+    return _B64_NL.join(flat[i:i + width] for i in range(0, len(flat), width))
+
+
+def _set_xmp_rating(xmp: bytes, rating: int) -> Optional[bytes]:
+    """XMP の★を書き換える。★の項目がなければ、末尾の空白（パディング）を同じ長さだけ削って差し込む。
+
+    XMP の長さを変えないので、base64 の長さや改行位置も変わらない。差し込めなければ None。
+    """
+    for pat in _XMP_RATING:
+        new, k = pat.subn(lambda m: m.group(1) + b"%d" % rating + m.group(3), xmp)
+        if k:
+            return new
+    if rating == 0:  # ★の項目がない＝★0
+        return xmp
+    tag = b"<xmp:Rating>%d</xmp:Rating>" % rating
+    i = xmp.find(_XMP_NS)
+    head_end = xmp.find(b">", i)
+    j = xmp.find(b"</rdf:Description>", i)
+    end = xmp.rfind(b"<?xpacket end")
+    if i < 0 or j < 0 or end < j or xmp[head_end - 1:head_end] == b"/" or xmp[end - len(tag):end].strip():
+        return None
+    return xmp[:j] + tag + xmp[j:end - len(tag)] + xmp[end:]
+
+
+def read_nksc_rating(nksc: Optional[str]) -> Optional[int]:
+    """NX Studio に表示される調整ファイルの★を返す。ファイルや★の欄がなければ None。"""
+    if not nksc:
+        return None
+    try:
+        with open(nksc, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    pk = _nksc_packet(data)
+    if pk:
+        for pat in _XMP_RATING:
+            m = pat.search(pk[1])
+            if m:
+                return int(m.group(2))
+    m = _NKSC_NINE.search(data)
+    if m:
+        return int(m.group(2))
+    return 0 if pk else None
+
+
+def write_nksc_rating(nksc: str, rating: int, keep_backup: bool = False) -> str:
+    """調整ファイルの★を書き換えて、"updated" / "unchanged" / "notag" のいずれかを返す。
+
+    埋め込み XMP の xmp:Rating と <nine:Rating> の★の部分だけを置き換え、ファイルの長さは変えない。
+    書き換えられない形式なら何もせず "notag" を返す。
+    同じフォルダの一時ファイルに書いてから置き換える。
+    keep_backup=True のとき、元のファイルを <名前>.nksc_original として残す。
+    """
+    if not 0 <= rating <= 5:
+        raise ValueError("rating は 0〜5")
+    with open(nksc, "rb") as f:
+        data = f.read()
+    pk = _nksc_packet(data)
+    if not pk:
+        return "notag"
+    m, xmp = pk
+    raw = m.group(1)
+    width = len(raw.split(_B64_NL, 1)[0])
+    new_xmp = _set_xmp_rating(xmp, rating)
+    if new_xmp is None or _wrap_b64(xmp, width) != raw:  # 改行位置を再現できない形式は触らない
+        return "notag"
+    new = data[:m.start(1)] + _wrap_b64(new_xmp, width) + data[m.end(1):]
+    new = _NKSC_NINE.sub(lambda m: m.group(1) + b"%d" % rating + m.group(3), new)
+    if new == data:
+        return "unchanged"
+    if keep_backup:
+        shutil.copy2(nksc, nksc + "_original")
+    tmp = nksc + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(new)
+        shutil.copymode(nksc, tmp)
+        os.replace(tmp, nksc)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return "updated"
+
+
+# --------------------------------------------------------------------------
 # レーティング書き込み
 # --------------------------------------------------------------------------
 @dataclass
@@ -431,6 +552,9 @@ class WriteSummary:
     unchanged: int = 0
     skipped: int = 0
     failed: int = 0
+    nksc_updated: int = 0     # NX Studio の調整ファイル
+    nksc_unchanged: int = 0
+    nksc_failed: int = 0
     messages: List[str] = field(default_factory=list)
 
 
@@ -445,19 +569,27 @@ _SUMMARY_PATTERNS = (
 def write_ratings(et: ExifTool, paths: Sequence[str], rating: int, keep_backup: bool = False,
                   only_unrated: bool = True,
                   progress: Optional[Callable[[int], None]] = None,
-                  extra_args: Sequence[str] = ()) -> WriteSummary:
+                  extra_args: Sequence[str] = (), nksc: bool = True) -> WriteSummary:
     """XMP:Rating を書き込む。画像データは変更しない。
 
     keep_backup=False のとき -overwrite_original（_original を作らない）。
     only_unrated=True のとき、すでに★が付いているファイルは変更しない。
+    nksc=True のとき、NX Studio の調整ファイルがあればその★も書き換える。
+    このとき only_unrated は、本体と調整ファイルのどちらかに★があればスキップする。
     -P でファイルの更新日時を保つ。
     """
     if not 0 <= rating <= 5:
         raise ValueError("rating は 0〜5")
     s = WriteSummary()
-    done = 0
-    for i in range(0, len(paths), WRITE_CHUNK):
-        chunk = list(paths[i:i + WRITE_CHUNK])
+    todo = list(paths)
+    if only_unrated:
+        current = read_ratings(et, todo, nksc=False)
+        todo = [p for p in todo if not current.get(os.path.normpath(p))
+                and not (nksc and read_nksc_rating(nksc_path(p)))]
+        s.skipped += len(paths) - len(todo)
+    done = len(paths) - len(todo)
+    for i in range(0, len(todo), WRITE_CHUNK):
+        chunk = todo[i:i + WRITE_CHUNK]
         args = list(extra_args) + ["-P", "-XMP:Rating=%d" % rating]
         if not keep_backup:
             args.insert(0, "-overwrite_original")
@@ -471,14 +603,38 @@ def write_ratings(et: ExifTool, paths: Sequence[str], rating: int, keep_backup: 
                 setattr(s, key, getattr(s, key) + int(m.group(1)))
         if err:
             s.messages.append(err)
+        if nksc:
+            for p in chunk:
+                _write_nksc(p, rating, keep_backup, s)
         done += len(chunk)
         if progress:
             progress(done)
     return s
 
 
-def read_ratings(et: ExifTool, paths: Sequence[str]) -> dict:
-    """{パス: ★} を返す（タグなしは 0）。"""
+def _write_nksc(path: str, rating: int, keep_backup: bool, s: WriteSummary):
+    n = nksc_path(path)
+    if not n:
+        return
+    try:
+        r = write_nksc_rating(n, rating, keep_backup)
+    except OSError as e:
+        r = "error: %s" % e
+    if r == "updated":
+        s.nksc_updated += 1
+    elif r == "unchanged":
+        s.nksc_unchanged += 1
+    else:
+        s.nksc_failed += 1
+        reason = "★を書き換えられない形式です" if r == "notag" else r
+        s.messages.append("NX Studio の調整ファイルを書き換えられません（%s）: %s" % (reason, n))
+
+
+def read_ratings(et: ExifTool, paths: Sequence[str], nksc: bool = True) -> dict:
+    """{パス: ★} を返す（タグなしは 0）。
+
+    nksc=True のとき、NX Studio の調整ファイルに★があればそちらを返す（NX Studio と同じ見え方）。
+    """
     res = {}
     for i in range(0, len(paths), META_CHUNK):
         chunk = list(paths[i:i + META_CHUNK])
@@ -489,4 +645,9 @@ def read_ratings(et: ExifTool, paths: Sequence[str]) -> dict:
             items = []
         for d in items:
             res[os.path.normpath(d.get("SourceFile", ""))] = _to_int(d.get("Rating")) or 0
+    if nksc:
+        for p in paths:
+            nr = read_nksc_rating(nksc_path(p))
+            if nr is not None:
+                res[os.path.normpath(p)] = nr
     return res

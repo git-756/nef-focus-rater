@@ -435,17 +435,18 @@ class WriteWorker(QThread):
     finished_ok = Signal(object, dict)
     failed = Signal(str)
 
-    def __init__(self, et, paths, rating, keep_backup, only_unrated):
+    def __init__(self, et, paths, rating, keep_backup, only_unrated, nksc):
         super().__init__()
         self.et, self.paths = et, paths
         self.rating, self.keep_backup, self.only_unrated = rating, keep_backup, only_unrated
+        self.nksc = nksc
 
     def run(self):
         try:
             n = len(self.paths)
             s = core.write_ratings(self.et, self.paths, self.rating, self.keep_backup, self.only_unrated,
-                                   progress=lambda d: self.progress.emit(d, n))
-            back = core.read_ratings(self.et, self.paths)
+                                   progress=lambda d: self.progress.emit(d, n), nksc=self.nksc)
+            back = core.read_ratings(self.et, self.paths, self.nksc)
             self.finished_ok.emit(s, back)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
@@ -586,7 +587,10 @@ class MainWindow(QMainWindow):
         self.chk_unrated = QCheckBox("すでに★がある写真は変更しない")
         self.chk_jpeg = QCheckBox("同名の JPEG にも書き込む（RAW+JPEG）")
         self.chk_backup = QCheckBox("元ファイル（_original）を残す")
-        for w in (self.chk_unrated, self.chk_jpeg, self.chk_backup):
+        self.chk_nksc = QCheckBox("NX Studio の調整ファイルにも書き込む")
+        self.chk_nksc.setToolTip("NKSC_PARAM フォルダの調整ファイル（.nksc）がある写真は、NX Studio がそちらの★を表示します。\n"
+                                 "★の数字だけを書き換え、編集内容には触れません。")
+        for w in (self.chk_unrated, self.chk_jpeg, self.chk_nksc, self.chk_backup):
             bot.addWidget(w)
         bot.addStretch(1)
         self.lbl_targets = QLabel("")
@@ -629,6 +633,7 @@ class MainWindow(QMainWindow):
         self.chk_unrated.setChecked(s.value("only_unrated", True, bool))
         self.chk_jpeg.setChecked(s.value("with_jpeg", True, bool))
         self.chk_backup.setChecked(s.value("keep_backup", False, bool))
+        self.chk_nksc.setChecked(s.value("with_nksc", True, bool))
         geo = s.value("geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -644,6 +649,7 @@ class MainWindow(QMainWindow):
         s.setValue("only_unrated", self.chk_unrated.isChecked())
         s.setValue("with_jpeg", self.chk_jpeg.isChecked())
         s.setValue("keep_backup", self.chk_backup.isChecked())
+        s.setValue("with_nksc", self.chk_nksc.isChecked())
         s.setValue("geometry", self.saveGeometry())
 
     def closeEvent(self, e):
@@ -853,20 +859,25 @@ class MainWindow(QMainWindow):
                     paths.append(j)
                     n_jpeg += 1
         rating = self.spin_rating.value()
+        with_nksc = self.chk_nksc.isChecked()
+        n_nksc = sum(1 for p in paths if core.nksc_path(p)) if with_nksc else 0
         msg = ("%d 枚の NEF%s に ★%d を書き込みます。\n\n"
                "・画像データは変更せず、レーティング（メタデータ）だけを書き換えます\n"
                "・元ファイル（_original）: %s\n"
-               "・すでに★がある写真: %s\n\n実行しますか？") % (
+               "・すでに★がある写真: %s\n%s\n実行しますか？") % (
             len(targets), "（＋同名 JPEG %d 枚）" % n_jpeg if n_jpeg else "", rating,
             "残す" if self.chk_backup.isChecked() else "残さない",
-            "変更しない" if self.chk_unrated.isChecked() else "上書きする")
+            "変更しない" if self.chk_unrated.isChecked() else "上書きする",
+            ("・NX Studio の調整ファイル %d 個の★も書き換えます。NX Studio を終了してから実行してください\n" % n_nksc)
+            if n_nksc else "")
         if QMessageBox.question(self, "書き込みの確認", msg) != QMessageBox.Yes:
             return
         self.btn_write.setEnabled(False)
         self.btn_analyze.setEnabled(False)
         self._busy(True, len(paths))
         self.statusBar().showMessage("書き込み中…")
-        self.worker = WriteWorker(self.et, paths, rating, self.chk_backup.isChecked(), self.chk_unrated.isChecked())
+        self.worker = WriteWorker(self.et, paths, rating, self.chk_backup.isChecked(), self.chk_unrated.isChecked(),
+                                  with_nksc)
         self.worker.progress.connect(lambda d, n: self._on_progress(d, n, "書き込み中…"))
         self.worker.finished_ok.connect(self._write_done)
         self.worker.failed.connect(self._worker_failed)
@@ -882,11 +893,14 @@ class MainWindow(QMainWindow):
         self.model.refresh()
         text = "更新 %d 枚 ／ ★済みのためスキップ %d 枚 ／ 変更なし %d 枚 ／ エラー %d 枚" % (
             s.updated, s.skipped, s.unchanged, s.failed)
-        self.statusBar().showMessage("書き込み完了: " + text)
+        if s.nksc_updated or s.nksc_unchanged or s.nksc_failed:
+            text += "\nNX Studio の調整ファイル: 更新 %d ／ 変更なし %d ／ エラー %d" % (
+                s.nksc_updated, s.nksc_unchanged, s.nksc_failed)
+        self.statusBar().showMessage("書き込み完了: " + text.replace("\n", " ／ "))
         detail = text
         if s.messages:
             detail += "\n\nexiftool のメッセージ:\n" + "\n".join(s.messages)[:2000]
-        (QMessageBox.warning if s.failed else QMessageBox.information)(self, "書き込み完了", detail)
+        (QMessageBox.warning if s.failed or s.nksc_failed else QMessageBox.information)(self, "書き込み完了", detail)
         self._update_targets()
 
 
